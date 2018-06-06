@@ -8,175 +8,116 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-use std;
-use std::collections::HashMap;
-
-use futures::{future, Future, Stream};
-use hyper;
-// TODO: enable TLS support; hurdle is cross-compiling openssl for Android.
-// See https://github.com/mozilla/mentat/issues/569
-// use hyper_tls;
-use hyper::{Method, Request, StatusCode, Error as HyperError};
-use hyper::header::{ContentType};
 use rusqlite;
-// TODO: https://github.com/mozilla/mentat/issues/570
-// use serde_cbor;
-use serde_json;
-use tokio_core::reactor::Core;
 use uuid::Uuid;
 
-use mentat_core::Entid;
-use metadata::SyncMetadataClient;
-use metadata::HeadTrackable;
-use schema::ensure_current_version;
-
+use mentat_core::{
+    Entid,
+};
+use mentat_db::{
+    CORE_SCHEMA_VERSION,
+};
+use bootstrap::{
+    BootstrapHelper,
+};
 use errors::{
     TolstoyError,
     Result,
 };
-
+use metadata::{
+    PartitionsTable,
+    SyncMetadata,
+};
+use remote_client::{
+    RemoteClient,
+};
+use schema::{
+    ensure_current_version,
+};
+use tx_uploader::TxUploader;
 use tx_processor::{
     Processor,
     TxReceiver,
+};
+use tx_mapper::{
+    TxMapper,
+};
+use types::{
+    LocalTx,
+    Tx,
     TxPart,
 };
 
-use tx_mapper::TxMapper;
-
-// TODO it would be nice to be able to pass
-// in a logger into Syncer::flow; would allow for a "debug mode"
-// and getting useful logs out of clients.
-// See https://github.com/mozilla/mentat/issues/571
-// Below is some debug Android-friendly logging:
-
-// use std::os::raw::c_char;
-// use std::os::raw::c_int;
-// use std::ffi::CString;
-// pub const ANDROID_LOG_DEBUG: i32 = 3;
-// extern { pub fn __android_log_write(prio: c_int, tag: *const c_char, text: *const c_char) -> c_int; }
-
-pub fn d(message: &str) {
-    println!("d: {}", message);
-    // let message = CString::new(message).unwrap();
-    // let message = message.as_ptr();
-    // let tag = CString::new("RustyToodle").unwrap();
-    // let tag = tag.as_ptr();
-    // unsafe { __android_log_write(ANDROID_LOG_DEBUG, tag, message) };
-}
+use logger::d;
 
 pub struct Syncer {}
 
-// TODO this is sub-optimal, we don't need to walk the table
-// to query the last thing in it w/ an index on tx!!
-// but it's the hammer at hand!
-// See https://github.com/mozilla/mentat/issues/572
-struct InquiringTxReceiver {
-    pub last_tx: Option<Entid>,
-    pub is_done: bool,
+pub enum SyncResult {
+    BadServerState,
+    EmptyServer,
+    NoChanges,
+    ServerFastForward,
+    AdoptedRemoteOnFirstSync,
+    IncompatibleBootstrapSchema,
+    LocalFastForward(Vec<Tx>),
+    Merge(Vec<Tx>, Vec<LocalTx>),
 }
 
-impl InquiringTxReceiver {
-    fn new() -> InquiringTxReceiver {
-        InquiringTxReceiver {
-            last_tx: None,
-            is_done: false,
+enum SyncAction {
+    NoOp,
+    // TODO this is the same as server fast-forward from local root.
+    PopulateServer,
+    ServerFastForward,
+    LocalFastForward,
+    // Generic name since we might merge, or rebase, or do something else.
+    CombineChanges,
+}
+
+// "Changed" is relative to previous sync.
+pub enum RemoteDataState {
+    Empty,
+    Changed,
+    Unchanged,
+}
+
+// Local client can't be empty: there's always at least a bootstrap transaction.
+// "Changed" is relative to previous sync.
+pub enum LocalDataState {
+    Changed,
+    Unchanged,
+}
+
+pub struct LocalTxSet {
+    pub txs: Vec<LocalTx>,
+}
+
+impl LocalTxSet {
+    pub fn new() -> LocalTxSet {
+        LocalTxSet {
+            txs: vec![]
         }
     }
 }
 
-impl TxReceiver for InquiringTxReceiver {
-    fn tx<T>(&mut self, tx_id: Entid, _datoms: &mut T) -> Result<()>
-    where T: Iterator<Item=TxPart> {
-        self.last_tx = Some(tx_id);
-        Ok(())
-    }
-
-    fn done(&mut self) -> Result<()> {
-        self.is_done = true;
-        Ok(())
-    }
-}
-
-struct UploadingTxReceiver<'c> {
-    pub tx_temp_uuids: HashMap<Entid, Uuid>,
-    pub is_done: bool,
-    remote_client: &'c RemoteClient,
-    remote_head: &'c Uuid,
-    rolling_temp_head: Option<Uuid>,
-}
-
-impl<'c> UploadingTxReceiver<'c> {
-    fn new(client: &'c RemoteClient, remote_head: &'c Uuid) -> UploadingTxReceiver<'c> {
-        UploadingTxReceiver {
-            tx_temp_uuids: HashMap::new(),
-            remote_client: client,
-            remote_head: remote_head,
-            rolling_temp_head: None,
-            is_done: false
-        }
-    }
-}
-
-impl<'c> TxReceiver for UploadingTxReceiver<'c> {
+impl TxReceiver for LocalTxSet {
     fn tx<T>(&mut self, tx_id: Entid, datoms: &mut T) -> Result<()>
     where T: Iterator<Item=TxPart> {
-        // Yes, we generate a new UUID for a given Tx, even if we might
-        // already have one mapped locally. Pre-existing local mapping will
-        // be replaced if this sync succeeds entirely.
-        // If we're seeing this tx again, it implies that previous attempt
-        // to sync didn't update our local head. Something went wrong last time,
-        // and it's unwise to try to re-use these remote tx mappings.
-        // We just leave garbage txs to be GC'd on the server.
-        let tx_uuid = Uuid::new_v4();
-        self.tx_temp_uuids.insert(tx_id, tx_uuid);
-        let mut tx_chunks = vec![];
-
-        // TODO separate bits of network work should be combined into single 'future'
-
-        // Upload all chunks.
-        for datom in datoms {
-            let datom_uuid = Uuid::new_v4();
-            tx_chunks.push(datom_uuid);
-            d(&format!("putting chunk: {:?}, {:?}", &datom_uuid, &datom));
-            // TODO switch over to CBOR once we're past debugging stuff.
-            // See https://github.com/mozilla/mentat/issues/570
-            // let cbor_val = serde_cbor::to_value(&datom)?;
-            // self.remote_client.put_chunk(&datom_uuid, &serde_cbor::ser::to_vec_sd(&cbor_val)?)?;
-            self.remote_client.put_chunk(&datom_uuid, &serde_json::to_string(&datom)?)?;
-        }
-
-        // Upload tx.
-        // NB: At this point, we may choose to update remote & local heads.
-        // Depending on how much we're uploading, and how unreliable our connection
-        // is, this might be a good thing to do to ensure we make at least some progress.
-        // Comes at a cost of possibly increasing racing against other clients.
-        match self.rolling_temp_head {
-            Some(parent) => {
-                d(&format!("putting transaction: {:?}, {:?}, {:?}", &tx_uuid, &parent, &tx_chunks));
-                self.remote_client.put_transaction(&tx_uuid, &parent, &tx_chunks)?;
-                
-            },
-            None => {
-                d(&format!("putting transaction: {:?}, {:?}, {:?}", &tx_uuid, &self.remote_head, &tx_chunks));
-                self.remote_client.put_transaction(&tx_uuid, self.remote_head, &tx_chunks)?;
-            }
-        }
-
-        d(&format!("updating rolling head: {:?}", tx_uuid));
-        self.rolling_temp_head = Some(tx_uuid.clone());
-
+        self.txs.push(LocalTx {
+            tx: tx_id,
+            parts: datoms.collect()
+        });
         Ok(())
     }
 
     fn done(&mut self) -> Result<()> {
-        self.is_done = true;
         Ok(())
     }
 }
 
 impl Syncer {
-    fn upload_ours(db_tx: &mut rusqlite::Transaction, from_tx: Option<Entid>, remote_client: &RemoteClient, remote_head: &Uuid) -> Result<()> {
-        let mut uploader = UploadingTxReceiver::new(remote_client, remote_head);
+    /// Upload local txs: (from_tx, HEAD]
+    fn fast_forward_server(db_tx: &mut rusqlite::Transaction, from_tx: Option<Entid>, remote_client: &RemoteClient, remote_head: &Uuid) -> Result<()> {
+        let mut uploader = TxUploader::new(remote_client, remote_head, SyncMetadata::get_partitions(db_tx, PartitionsTable::Core)?);
         Processor::process(db_tx, from_tx, &mut uploader)?;
         if !uploader.is_done {
             bail!(TolstoyError::TxProcessorUnfinished);
@@ -187,246 +128,219 @@ impl Syncer {
             // Upload remote head.
             remote_client.put_head(&last_tx_uploaded)?;
 
-            // On succes:
+            // On success:
             // - persist local mappings from the receiver
             // - update our local "remote head".
             TxMapper::set_bulk(db_tx, &uploader.tx_temp_uuids)?;
-            SyncMetadataClient::set_remote_head(db_tx, &last_tx_uploaded)?;
+            SyncMetadata::set_remote_head(db_tx, &last_tx_uploaded)?;
         }
 
         Ok(())
     }
 
-    pub fn flow(sqlite: &mut rusqlite::Connection, server_uri: &String, user_uuid: &Uuid) -> Result<()> {
+    fn what_do(remote_state: RemoteDataState, local_state: LocalDataState) -> SyncAction {
+        match remote_state {
+            RemoteDataState::Empty => {
+                SyncAction::PopulateServer
+            },
+
+            RemoteDataState::Changed => {
+                match local_state {
+                    LocalDataState::Changed => {
+                        SyncAction::CombineChanges
+                    },
+
+                    LocalDataState::Unchanged => {
+                        SyncAction::LocalFastForward
+                    },
+                }
+            },
+
+            RemoteDataState::Unchanged => {
+                match local_state {
+                    LocalDataState::Changed => {
+                        SyncAction::ServerFastForward
+                    },
+
+                    LocalDataState::Unchanged => {
+                        SyncAction::NoOp
+                    },
+                }
+            },
+        }
+    }
+
+    fn remote_data_state(known_remote_head: &Uuid, actual_remote_head: &Uuid) -> RemoteDataState {
+        if *actual_remote_head == Uuid::nil() {
+            RemoteDataState::Empty
+
+        } else if actual_remote_head != known_remote_head {
+            RemoteDataState::Changed
+        } else {
+            RemoteDataState::Unchanged
+        }
+    }
+
+    fn local_data_state(db_tx: &rusqlite::Transaction, local_metadata: &SyncMetadata) -> Result<LocalDataState> {
+        // We have local changes if head transaction hasn't been "mapped" (i.e. uploaded).
+        if TxMapper::get(db_tx, local_metadata.head)?.is_none() {
+            Ok(LocalDataState::Changed)
+        } else {
+            Ok(LocalDataState::Unchanged)
+        }
+    }
+    
+    fn map_remote_bootstrap(db_tx: &mut rusqlite::Transaction, remote_bootstrap: &Tx, local_bootstrap: Entid) -> Result<()> {
+        let helper = BootstrapHelper::new(remote_bootstrap);
+
+        if !helper.is_compatible()? {
+            bail!(TolstoyError::IncompatibleBootstrapSchema(CORE_SCHEMA_VERSION as i64, helper.core_schema_version()?));
+        }
+
+        d(&format!("mapping incoming bootstrap tx uuid to local bootstrap entid: {} -> {}", remote_bootstrap.tx, local_bootstrap));
+
+        // Map incoming bootstrap tx uuid to local bootstrap entid.
+        // If there's more work to do, we'll move the head again.
+        SyncMetadata::set_remote_head(db_tx, &remote_bootstrap.tx)?;
+        TxMapper::set_tx_uuid(db_tx, local_bootstrap, &remote_bootstrap.tx)?;
+
+        Ok(())
+    }
+
+    fn first_sync_against_non_empty(db_tx: &mut rusqlite::Transaction, remote_client: &RemoteClient, local_metadata: &SyncMetadata) -> Result<SyncResult> {
+        d(&format!("server non-empty on first sync, adopting remote state."));
+
+        // 1) Download remote transactions.
+        let incoming_txs = remote_client.get_transaction_data_after(&Uuid::nil())?;
+        if incoming_txs.len() == 0 {
+            bail!(TolstoyError::BadServerState("Server specified non-root HEAD but gave no transactions".to_string()));
+        }
+
+        // 2) Process remote bootstrap.
+        Syncer::map_remote_bootstrap(db_tx, &incoming_txs[0], local_metadata.root)?;
+
+        // 3) Determine new local and remote data states, now that bootstrap has been dealt with.
+        let remote_state = if incoming_txs.len() > 1 {
+            RemoteDataState::Changed
+        } else {
+            RemoteDataState::Unchanged
+        };
+
+        let local_state = if local_metadata.root != local_metadata.head {
+            LocalDataState::Changed
+        } else {
+            LocalDataState::Unchanged
+        };
+
+        // 4) The rest isn't special anymore: proceed with regular flow. TODO merge two flows together?
+        // This is largely the same as the main flow, except we already have a set of incoming transactions.
+
+        match Syncer::what_do(remote_state, local_state) {
+            SyncAction::NoOp => {
+                Ok(SyncResult::NoChanges)
+            },
+
+            SyncAction::PopulateServer => {
+                bail!(TolstoyError::UnexpectedState(format!("Remote state can't be empty on first sync against non-empty server")))
+            },
+
+            SyncAction::ServerFastForward => {
+                bail!(TolstoyError::NotYetImplemented(format!("TODO fast-forward server on first sync against non-empty when remote is just bootstrap and local has more")))
+            },
+
+            SyncAction::LocalFastForward => {
+                Ok(SyncResult::LocalFastForward(incoming_txs[1 ..].to_vec()))
+            },
+
+            SyncAction::CombineChanges => {
+                let mut local_txs = LocalTxSet::new();
+                Processor::process(db_tx, Some(local_metadata.root), &mut local_txs)?;
+                Ok(SyncResult::Merge(incoming_txs[1 ..].to_vec(), local_txs.txs))
+            }
+        }
+    }
+
+    fn local_tx_for_uuid(db_tx: &rusqlite::Transaction, uuid: &Uuid) -> Result<Entid> {
+        match TxMapper::get_tx_for_uuid(db_tx, uuid)? {
+            Some(t) => Ok(t),
+            None => bail!(TolstoyError::TxIncorrectlyMapped(0))
+        }
+    }
+
+    pub fn flow(db_tx: &mut rusqlite::Transaction, server_uri: &String, user_uuid: &Uuid) -> Result<SyncResult> {
         d(&format!("sync flowing"));
 
-        ensure_current_version(sqlite)?;
+        ensure_current_version(db_tx)?;
         
-        // TODO configure this sync with some auth data
+        // TODO auth, crypto, etc...
         let remote_client = RemoteClient::new(server_uri.clone(), user_uuid.clone());
-        let mut db_tx = sqlite.transaction()?;
 
         let remote_head = remote_client.get_head()?;
         d(&format!("remote head {:?}", remote_head));
 
-        let locally_known_remote_head = SyncMetadataClient::remote_head(&db_tx)?;
+        let locally_known_remote_head = SyncMetadata::remote_head(db_tx)?;
         d(&format!("local head {:?}", locally_known_remote_head));
 
-        // Local head: latest transaction that we have in the store,
-        // but with one caveat: its tx might will not be mapped if it's
-        // never been synced successfully.
-        // In other words: if latest tx isn't mapped, then HEAD moved
-        // since last sync and server needs to be updated.
-        let mut inquiring_tx_receiver = InquiringTxReceiver::new();
-        // TODO don't just start from the beginning... but then again, we should do this
-        // without walking the table at all, and use the tx index.
-        Processor::process(&db_tx, None, &mut inquiring_tx_receiver)?;
-        if !inquiring_tx_receiver.is_done {
-            bail!(TolstoyError::TxProcessorUnfinished);
-        }
-        let have_local_changes = match inquiring_tx_receiver.last_tx {
-            Some(tx) => {
-                match TxMapper::get(&db_tx, tx)? {
-                    Some(_) => false,
-                    None => true
-                }
-            },
-            None => false
-        };
+        let (root, head) = SyncMetadata::root_and_head_tx(db_tx)?;
+        let local_metadata = SyncMetadata::new(root, head);
+        let local_state = Syncer::local_data_state(db_tx, &local_metadata)?;
+        let remote_state = Syncer::remote_data_state(&locally_known_remote_head, &remote_head);
 
-        // Check if the server is empty - populate it.
-        if remote_head == Uuid::nil() {
-            d(&format!("empty server!"));
-            Syncer::upload_ours(&mut db_tx, None, &remote_client, &remote_head)?;
-        
-        // Check if the server is the same as us, and if our HEAD moved.
-        } else if locally_known_remote_head == remote_head {
-            d(&format!("server unchanged since last sync."));
-            
-            if !have_local_changes {
+        // Currently, first sync against a non-empty server is special.
+        if locally_known_remote_head == Uuid::nil() && remote_head != Uuid::nil() {
+            return Syncer::first_sync_against_non_empty(db_tx, &remote_client, &local_metadata);
+        }
+
+        match Syncer::what_do(remote_state, local_state) {
+            SyncAction::NoOp => {
                 d(&format!("local HEAD did not move. Nothing to do!"));
-                return Ok(());
-            }
+                Ok(SyncResult::NoChanges)
+            },
 
-            d(&format!("local HEAD moved."));
-            // TODO it's possible that we've successfully advanced remote head previously,
-            // but failed to advance our own local head. If that's the case, and we can recognize it,
-            // our sync becomes just bumping our local head. AFAICT below would currently fail.
-            if let Some(upload_from_tx) = TxMapper::get_tx_for_uuid(&db_tx, &locally_known_remote_head)? {
+            SyncAction::PopulateServer => {
+                d(&format!("empty server!"));
+                Syncer::fast_forward_server(db_tx, None, &remote_client, &remote_head)?;
+                Ok(SyncResult::EmptyServer)
+            },
+
+            SyncAction::ServerFastForward => {
+                d(&format!("local HEAD moved."));
+                let upload_from_tx = Syncer::local_tx_for_uuid(db_tx, &locally_known_remote_head)?;
+
                 d(&format!("Fast-forwarding the server."));
-                Syncer::upload_ours(&mut db_tx, Some(upload_from_tx), &remote_client, &remote_head)?;
-            } else {
-                d(&format!("Unable to fast-forward the server; missing local tx mapping"));
-                bail!(TolstoyError::TxIncorrectlyMapped(0));
-            }
-            
-        // We diverged from the server.
-        // We'll need to rebase/merge ourselves on top of it.
-        } else {
-            d(&format!("server changed since last sync."));
 
-            bail!(TolstoyError::NotYetImplemented(
-                format!("Can't yet sync against changed server. Local head {:?}, remote head {:?}", locally_known_remote_head, remote_head)
-            ));
+                // TODO it's possible that we've successfully advanced remote head previously,
+                // but failed to advance our own local head. If that's the case, and we can recognize it,
+                // our sync becomes just bumping our local head. AFAICT below would currently fail.
+                Syncer::fast_forward_server(db_tx, Some(upload_from_tx), &remote_client, &remote_head)?;
+                Ok(SyncResult::ServerFastForward)
+            },
+
+            SyncAction::LocalFastForward => {
+                d(&format!("fast-forwarding local store."));
+                Ok(SyncResult::LocalFastForward(
+                    remote_client.get_transaction_data_after(&locally_known_remote_head)?
+                ))
+            },
+
+            SyncAction::CombineChanges => {
+                d(&format!("combining changes from local and remote stores."));
+                let mut local_txs = LocalTxSet::new();
+                Processor::process(db_tx, Some(Syncer::local_tx_for_uuid(db_tx, &locally_known_remote_head)?), &mut local_txs)?;
+                Ok(SyncResult::Merge(
+                    remote_client.get_transaction_data_after(&locally_known_remote_head)?,
+                    local_txs.txs
+                ))
+            },
         }
-
-        // Commit everything, if there's anything to commit!
-        // Any new tx->uuid mappings and the new HEAD. We're synced!
-        db_tx.commit()?;
-
-        Ok(())
-    }
-}
-
-#[derive(Serialize,Deserialize)]
-struct SerializedHead {
-    head: Uuid
-}
-
-#[derive(Serialize)]
-struct SerializedTransaction<'a> {
-    parent: &'a Uuid,
-    chunks: &'a Vec<Uuid>
-}
-
-struct RemoteClient {
-    base_uri: String,
-    user_uuid: Uuid
-}
-
-
-impl RemoteClient {
-    fn new(base_uri: String, user_uuid: Uuid) -> Self {
-        RemoteClient {
-            base_uri: base_uri,
-            user_uuid: user_uuid
-        }
-    }
-
-    fn bound_base_uri(&self) -> String {
-        // TODO escaping
-        format!("{}/{}", self.base_uri, self.user_uuid)
-    }
-
-    fn get_uuid(&self, uri: String) -> Result<Uuid> {
-        let mut core = Core::new()?;
-        // TODO enable TLS, see https://github.com/mozilla/mentat/issues/569
-        // let client = hyper::Client::configure()
-        //     .connector(hyper_tls::HttpsConnector::new(4, &core.handle()).unwrap())
-        //     .build(&core.handle());
-        let client = hyper::Client::new(&core.handle());
-
-        d(&format!("client"));
-
-        let uri = uri.parse()?;
-
-        d(&format!("parsed uri {:?}", uri));
-        
-        let work = client.get(uri).and_then(|res| {
-            println!("Response: {}", res.status());
-
-            res.body().concat2().and_then(move |body| {
-                let head_json: SerializedHead = serde_json::from_slice(&body).map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::Other, e)
-                })?;
-                Ok(head_json)
-            })
-        });
-
-        d(&format!("running..."));
-
-        let head_json = core.run(work)?;
-        d(&format!("got head: {:?}", &head_json.head));
-        Ok(head_json.head)
-    }
-
-    fn put<T>(&self, uri: String, payload: T, expected: StatusCode) -> Result<()>
-    where hyper::Body: std::convert::From<T>, {
-        let mut core = Core::new()?;
-        // TODO enable TLS, see https://github.com/mozilla/mentat/issues/569
-        // let client = hyper::Client::configure()
-        //     .connector(hyper_tls::HttpsConnector::new(4, &core.handle()).unwrap())
-        //     .build(&core.handle());
-        let client = hyper::Client::new(&core.handle());
-
-        let uri = uri.parse()?;
-
-        d(&format!("PUT {:?}", uri));
-
-        let mut req = Request::new(Method::Put, uri);
-        req.headers_mut().set(ContentType::json());
-        req.set_body(payload);
-
-        let put = client.request(req).and_then(|res| {
-            let status_code = res.status();
-
-            if status_code != expected {
-                d(&format!("bad put response: {:?}", status_code));
-                future::err(HyperError::Status)
-            } else {
-                future::ok(())
-            }
-        });
-
-        core.run(put)?;
-        Ok(())
-    }
-
-    fn put_transaction(&self, transaction_uuid: &Uuid, parent_uuid: &Uuid, chunks: &Vec<Uuid>) -> Result<()> {
-        // {"parent": uuid, "chunks": [chunk1, chunk2...]}
-        let transaction = SerializedTransaction {
-            parent: parent_uuid,
-            chunks: chunks
-        };
-
-        let uri = format!("{}/transactions/{}", self.bound_base_uri(), transaction_uuid);
-        let json = serde_json::to_string(&transaction)?;
-        d(&format!("serialized transaction: {:?}", json));
-        self.put(uri, json, StatusCode::Created)
-    }
-
-    fn get_head(&self) -> Result<Uuid> {
-        let uri = format!("{}/head", self.bound_base_uri());
-        self.get_uuid(uri)
-    }
-
-    fn put_head(&self, uuid: &Uuid) -> Result<()> {
-        // {"head": uuid}
-        let head = SerializedHead {
-            head: uuid.clone()
-        };
-
-        let uri = format!("{}/head", self.bound_base_uri());
-        let json = serde_json::to_string(&head)?;
-        d(&format!("serialized head: {:?}", json));
-        self.put(uri, json, StatusCode::NoContent)
-    }
-
-    fn put_chunk(&self, chunk_uuid: &Uuid, payload: &String) -> Result<()> {
-        let uri = format!("{}/chunks/{}", self.bound_base_uri(), chunk_uuid);
-        d(&format!("serialized chunk: {:?}", payload));
-        // TODO don't want to clone every datom!
-        self.put(uri, payload.clone(), StatusCode::Created)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::borrow::Borrow;
-    use std::str::FromStr;
-
-    use edn;
 
     use mentat_db::debug::{TestConn};
-
-    #[test]
-    fn test_remote_client_bound_uri() {
-        let user_uuid = Uuid::from_str(&"316ea470-ce35-4adf-9c61-e0de6e289c59").expect("uuid");
-        let server_uri = String::from("https://example.com/api/0.1");
-        let remote_client = RemoteClient::new(server_uri, user_uuid);
-        assert_eq!("https://example.com/api/0.1/316ea470-ce35-4adf-9c61-e0de6e289c59", remote_client.bound_base_uri());
-    }
 
     #[test]
     fn test_add() {

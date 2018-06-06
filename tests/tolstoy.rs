@@ -32,11 +32,14 @@ mod tests {
         TypedValue,
         ValueType,
     };
+    use mentat_tolstoy::types::{
+        TxPart,
+    };
 
     struct TxCountingReceiver {
         pub tx_count: usize,
         pub is_done: bool,
-    }
+    };
 
     impl TxCountingReceiver {
         fn new() -> TxCountingReceiver {
@@ -101,7 +104,7 @@ mod tests {
         let mut conn = Conn::connect(&mut c).expect("Couldn't open DB.");
         {
             let db_tx = c.transaction().expect("db tx");
-            // Don't inspect the bootstrap transaction, but we'd like to see it's there.
+            // Ensure that we see a bootstrap transaction.
             let mut receiver = TxCountingReceiver::new();
             assert_eq!(false, receiver.is_done);
             Processor::process(&db_tx, None, &mut receiver).expect("processor");
@@ -116,7 +119,12 @@ mod tests {
         ]"#).expect("successful transaction").tempids;
         let numba_entity_id = ids.get("s").unwrap();
 
-        let bootstrap_tx;
+        let ids = conn.transact(&mut c, r#"[
+            [:db/add "b" :foo/numba 123]
+        ]"#).expect("successful transaction").tempids;
+        let _asserted_e = ids.get("b").unwrap();
+
+        let first_tx;
         {
             let db_tx = c.transaction().expect("db tx");
             // Expect to see one more transaction of four parts (one for tx datom itself).
@@ -125,10 +133,11 @@ mod tests {
 
             println!("{:#?}", receiver);
 
-            assert_eq!(2, receiver.txes.keys().count());
-            assert_tx_datoms_count(&receiver, 1, 4);
+            // Three transactions: bootstrap, vocab, assertion.
+            assert_eq!(3, receiver.txes.keys().count());
+            assert_tx_datoms_count(&receiver, 2, 2);
 
-            bootstrap_tx = Some(*receiver.txes.keys().nth(0).expect("bootstrap tx"));
+            first_tx = Some(*receiver.txes.keys().nth(1).expect("first non-bootstrap tx"));
         }
 
         let ids = conn.transact(&mut c, r#"[
@@ -142,13 +151,15 @@ mod tests {
             // Expect to see a single two part transaction
             let mut receiver = TestingReceiver::new();
 
-            // Note that we're asking for the bootstrap tx to be skipped by the processor.
-            Processor::process(&db_tx, bootstrap_tx, &mut receiver).expect("processor");
+            // Note that we're asking for the first transacted tx to be skipped by the processor.
+            Processor::process(&db_tx, first_tx, &mut receiver).expect("processor");
 
+            // Vocab, assertion.
             assert_eq!(2, receiver.txes.keys().count());
+            // Assertion datoms.
             assert_tx_datoms_count(&receiver, 1, 2);
 
-            // Inspect the transaction part.
+            // Inspect the assertion.
             let tx_id = receiver.txes.keys().nth(1).expect("tx");
             let datoms = receiver.txes.get(tx_id).expect("datoms");
             let part = datoms.iter().find(|&part| &part.e == asserted_e).expect("to find asserted datom");
@@ -159,5 +170,4 @@ mod tests {
             assert_eq!(true, part.added);
         }
     }
-
 }

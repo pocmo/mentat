@@ -403,7 +403,7 @@ impl Repl {
         if self.path.is_empty() || path != self.path {
             let next = match encryption_key {
                 #[cfg(not(feature = "sqlcipher"))]
-                Some(_) => return Err(::mentat::MentatError::RusqliteError(".open_encrypted requires the sqlcipher Mentat feature".into())),
+                Some(_) => return Err(::mentat::MentatError::RusqliteError(".open_encrypted requires the sqlcipher Mentat feature".into(), "".into())),
                 #[cfg(feature = "sqlcipher")]
                 Some(k) => {
                     Store::open_with_key(path.as_str(), k)?

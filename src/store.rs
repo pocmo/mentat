@@ -14,10 +14,6 @@ use std::collections::{
     BTreeMap,
 };
 
-use std::path::{
-    Path,
-};
-
 use std::sync::{
     Arc,
 };
@@ -38,11 +34,6 @@ use mentat_db::{
     TxObserver,
 };
 
-#[cfg(feature = "syncable")]
-use mentat_tolstoy::Syncer;
-
-use uuid::Uuid;
-
 use conn::{
     CacheAction,
     CacheDirection,
@@ -51,7 +42,6 @@ use conn::{
     InProgressRead,
     Pullable,
     Queryable,
-    Syncable
 };
 
 use errors::*;
@@ -61,6 +51,11 @@ use query::{
     QueryExplanation,
     QueryInputs,
     QueryOutput,
+};
+
+#[cfg(feature = "syncable")]
+use sync::{
+    Syncable,
 };
 
 /// A convenience wrapper around a single SQLite connection and a Conn. This is suitable
@@ -206,8 +201,7 @@ impl Pullable for Store {
 #[cfg(feature = "syncable")]
 impl Syncable for Store {
     fn sync(&mut self, server_uri: &String, user_uuid: &String) -> Result<()> {
-        let uuid = Uuid::parse_str(&user_uuid).map_err(|_| MentatError::BadUuid(user_uuid.clone()))?;
-        Ok(Syncer::flow(&mut self.sqlite, server_uri, &uuid)?)
+        self.conn.sync(&mut self.sqlite, server_uri, user_uuid)
     }
 }
 
@@ -217,10 +211,13 @@ mod tests {
 
     extern crate time;
 
+    use uuid::Uuid;
+
     use std::collections::{
         BTreeSet,
     };
     use std::path::{
+        Path,
         PathBuf,
     };
     use std::sync::mpsc;
