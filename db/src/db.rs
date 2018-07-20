@@ -465,7 +465,7 @@ pub(crate) fn read_ident_map(conn: &rusqlite::Connection) -> Result<IdentMap> {
 pub(crate) fn read_attribute_map(conn: &rusqlite::Connection) -> Result<AttributeMap> {
     let entid_triples = read_materialized_view(conn, "schema")?;
     let mut attribute_map = AttributeMap::default();
-    metadata::update_attribute_map_from_entid_triples(&mut attribute_map, entid_triples, ::std::iter::empty())?;
+    metadata::update_attribute_map_from_entid_triples(&mut attribute_map, entid_triples, vec![])?;
     Ok(attribute_map)
 }
 
@@ -1028,6 +1028,7 @@ pub fn update_metadata(conn: &rusqlite::Connection, _old_schema: &Schema, new_sc
 
         conn.execute(format!("DELETE FROM schema").as_str(),
                      &[])?;
+        // NB: we're using :db/valueType as a placeholder for the entire schema-defining set.
         let s = format!(r#"
             WITH s(e) AS (SELECT e FROM datoms WHERE a = {})
             INSERT INTO schema
@@ -1535,7 +1536,10 @@ mod tests {
     fn test_db_install() {
         let mut conn = TestConn::default();
 
-        // We can assert a new attribute.
+        // We're missing some tests here, since our implementation is incomplete.
+        // See https://github.com/mozilla/mentat/issues/797
+
+        // We can assert a new schema attribute.
         assert_transact!(conn, "[[:db/add 100 :db/ident :test/ident]
                                  [:db/add 100 :db/valueType :db.type/long]
                                  [:db/add 100 :db/cardinality :db.cardinality/many]]");
@@ -1572,15 +1576,26 @@ mod tests {
                           [101 :test/ident -9 ?tx true]
                           [?tx :db/txInstant ?ms ?tx true]]");
 
-        // Cannot retract a characteristic of an installed attribute.
+        // Cannot retract a single characteristic of an installed attribute.
         assert_transact!(conn,
                          "[[:db/retract 100 :db/cardinality :db.cardinality/many]]",
                          Err("bad schema assertion: Retracting attribute 8 for entity 100 not permitted."));
 
-        // Cannot retract a characteristic of an installed attribute.
+        // Cannot retract a single characteristic of an installed attribute.
         assert_transact!(conn,
                          "[[:db/retract 100 :db/valueType :db.type/long]]",
                          Err("bad schema assertion: Retracting attribute 7 for entity 100 not permitted."));
+        
+        // Cannot retract a non-defining set of characteristics of an installed attribute.
+        assert_transact!(conn,
+                         "[[:db/retract 100 :db/valueType :db.type/long]
+                         [:db/retract 100 :db/cardinality :db.cardinality/many]]",
+                         Err("bad schema assertion: Retracting defining attributes of a schema without retracting its :db/ident is not permitted."));
+
+        // See https://github.com/mozilla/mentat/issues/796.
+        // assert_transact!(conn,
+        //                 "[[:db/retract 100 :db/ident :test/ident]]",
+        //                 Err("bad schema assertion: Retracting :db/ident of a schema without retracting its defining attributes is not permitted."));
 
         // Can retract all of characterists of an installed attribute in one go.
         assert_transact!(conn,
