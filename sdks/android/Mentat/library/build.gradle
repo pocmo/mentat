@@ -72,6 +72,6 @@ archivesBaseName = 'mentat'
 
 apply from: '../publish.gradle'
 ext.configurePublish(
-        'org.mozilla',
+        'org.mozilla.mentat',
         'mentat',
         'A persistent, embedded knowledge base.')
