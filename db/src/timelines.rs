@@ -168,8 +168,8 @@ mod tests {
     // Real consumers will perform similar operations when appropriate.
     fn update_conn(conn: &mut TestConn, schema: &Option<Schema>, pmap: &PartitionMap) {
         match schema {
-            Some(s) => conn.schema = s.clone(),
-            None => ()
+            &Some(ref s) => conn.schema = s.clone(),
+            &None => ()
         };
         conn.partition_map = pmap.clone();
     }
