@@ -130,8 +130,18 @@ use watcher::{
     TransactWatcher,
 };
 
+/// Defines transactor's high level behaviour.
 pub(crate) enum TransactorAction {
+    /// Materialize transaction into 'datoms' and metadata
+    /// views, but do not commit it into 'transactions' table.
+    /// Use this if you need transaction's "side-effects", but
+    /// don't want its by-products to end-up in the transaction log,
+    /// e.g. when rewinding.
     Materialize,
+
+    /// Materialize transaction into 'datoms' and metadata
+    /// views, and also commit it into the 'transactions' table.
+    /// Use this for regular transactions.
     MaterializeAndCommit,
 }
 
@@ -798,11 +808,11 @@ impl<'conn, 'a, W> Tx<'conn, 'a, W> where W: TransactWatcher {
 
         match action {
             TransactorAction::Materialize => {
-                self.store.materialize_transaction(self.tx_id)?;
+                self.store.materialize_mentat_transaction(self.tx_id)?;
             },
             TransactorAction::MaterializeAndCommit => {
-                self.store.materialize_transaction(self.tx_id)?;
-                self.store.commit_transaction(self.tx_id)?;
+                self.store.materialize_mentat_transaction(self.tx_id)?;
+                self.store.commit_mentat_transaction(self.tx_id)?;
             }
         }
 
@@ -815,8 +825,8 @@ impl<'conn, 'a, W> Tx<'conn, 'a, W> where W: TransactWatcher {
             println!("might update schema!");
             // Extract changes to metadata from the store.
             let metadata_assertions = match action {
-                TransactorAction::Materialize => self.store.resolved_metadata_assertions(self.tx_id)?,
-                TransactorAction::MaterializeAndCommit => self.store.committed_metadata_assertions(self.tx_id)?
+                TransactorAction::Materialize => self.store.resolved_metadata_assertions()?,
+                TransactorAction::MaterializeAndCommit => db::committed_metadata_assertions(self.store, self.tx_id)?
             };
             println!("assertions: {:?}", metadata_assertions);
             let mut new_schema = (*self.schema_for_mutation).clone(); // Clone the underlying Schema for modification.
