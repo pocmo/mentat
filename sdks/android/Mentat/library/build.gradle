@@ -1,5 +1,5 @@
 apply plugin: 'com.android.library'
-apply plugin: 'com.nishtahir.rust-android'
+apply plugin: 'org.mozilla.rust-android-gradle.rust-android'
 
 apply plugin: 'kotlin-android'
 apply plugin: 'com.jfrog.bintray'
@@ -40,7 +40,11 @@ cargo {
     targetDirectory = '../../../../target'
     targetInclude = 'libmentat_ffi.so'
 
-    targets = ['x86']
+    targets = [
+        'x86',
+        'arm',
+        'arm64',
+    ]
 }
 
 dependencies {
