@@ -121,11 +121,11 @@ fn update_attribute_map_from_schema_retractions(attribute_map: &mut AttributeMap
     // Filter out sets of schema altering retractions.
     let mut eas = BTreeMap::new();
     for (e, a, v) in retractions.into_iter() {
-        if a != entids::DB_VALUE_TYPE && a != entids::DB_CARDINALITY {
-            filtered_retractions.push((e, a, v));
-        } else {
+        if entids::is_a_schema_attribute(a) {
             eas.entry(e).or_insert(vec![]).push(a);
             suspect_retractions.push((e, a, v));
+        } else {
+            filtered_retractions.push((e, a, v));
         }
     }
 
@@ -152,6 +152,7 @@ fn update_attribute_map_from_schema_retractions(attribute_map: &mut AttributeMap
             attributes.contains(&entids::DB_VALUE_TYPE) {
                 // Ensure that corresponding :db/ident is also being retracted at the same time.
                 if ident_retractions.contains_key(&e) {
+                    // Remove attributes corresponding to retracted attribute.
                     attribute_map.remove(&e);
                 } else {
                     bail!(DbErrorKind::BadSchemaAssertion(format!("Retracting defining attributes of a schema without retracting its :db/ident is not permitted.")));
@@ -313,7 +314,7 @@ pub fn update_attribute_map_from_entid_triples(attribute_map: &mut AttributeMap,
                 // … and twice, now we have the Attribute.
                 let a = builder.build();
                 a.validate(|| entid.to_string())?;
-                entry.insert(builder.build());
+                entry.insert(a);
                 attributes_installed.insert(entid);
             },
 
@@ -397,13 +398,20 @@ pub fn update_schema_from_entid_quadruples<U>(schema: &mut Schema, assertions: U
         idents_altered.insert(entid, IdentAlteration::Ident(new_ident.clone()));
     }
 
-    for (entid, ident) in ident_set.retracted {
-        schema.entid_map.remove(&entid);
-        schema.ident_map.remove(&ident);
-        idents_altered.insert(entid, IdentAlteration::Ident(ident.clone()));
+    for (entid, ident) in &ident_set.retracted {
+        schema.entid_map.remove(entid);
+        schema.ident_map.remove(ident);
+        idents_altered.insert(*entid, IdentAlteration::Ident(ident.clone()));
     }
 
-    if report.attributes_did_change() {
+    // Component attributes need to change if either:
+    // - a component attribute changed
+    // - a schema attribute that was a component was retracted
+    // These two checks are a rather heavy-handed way of keeping schema's
+    // component_attributes up-to-date: most of the time we'll rebuild it
+    // even though it's not necessary (e.g. a schema attribute that's _not_
+    // a component was removed, or a non-component related attribute changed).
+    if report.attributes_did_change() || ident_set.retracted.len() > 0 {
         schema.update_component_attributes();
     }
 
