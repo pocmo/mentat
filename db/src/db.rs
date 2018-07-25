@@ -301,7 +301,7 @@ fn create_current_partition_view(conn: &rusqlite::Connection) -> Result<()> {
     })?.collect();
 
     let mut case = vec![];
-    for (part, end) in known_parts?.iter() {
+    for &(ref part, ref end) in known_parts?.iter() {
         case.push(format!(r#"WHEN e <= {} THEN "{}""#, end, part));
     }
 
