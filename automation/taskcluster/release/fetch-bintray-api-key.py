@@ -5,7 +5,7 @@
 import os
 import taskcluster
 
-SECRET_NAME = 'project/android-components/publish'
+SECRET_NAME = 'project/mentat/publish'
 TASKCLUSTER_BASE_URL = 'http://taskcluster/secrets/v1'
 
 def fetch_publish_secrets(secret_name):

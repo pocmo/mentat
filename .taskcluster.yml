@@ -53,7 +53,7 @@ tasks:
         events:
           - release
     scopes:
-      - "secrets:get:project/android-components/publish"
+      - "secrets:get:project/mentat/publish"
     payload:
       maxRunTime: 3600
       deadline: "{{ '2 hours' | $fromNow }}"
